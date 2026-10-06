@@ -1,0 +1,10 @@
+[
+  {
+    "source": 0,
+    "camera_id": "camera-01"
+  },
+  {
+    "source": 1,
+    "camera_id": "camera-02"
+  }
+]
