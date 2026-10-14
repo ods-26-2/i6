@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from collections import deque
 import paho.mqtt.client as mqtt
 from pathlib import Path
+from pyzbar.pyzbar import decode
+import base64
 
 CAMERAS_CONFIG_FILE = Path(__file__).with_name("cameras.json")
 
@@ -202,47 +204,38 @@ def detect_and_decode(
         cv2.THRESH_BINARY | cv2.THRESH_OTSU
     )
 
-    texts, points = detector.detectAndDecode(
-        frame
+    decoded_objects = decode(
+        binarized
     )
 
     candidates = []
 
-    if texts and points is not None:
-        for text, pts in zip(
-            texts,
-            points
-        ):
-            if not text:
-                continue
+    for obj in decoded_objects:
+        raw_data = obj.data
 
-            pts = np.array(
-                pts,
-                dtype=np.float32
-            )
+        text = base64.b64encode(
+            raw_data
+        ).decode("ascii")
 
-            area = cv2.contourArea(
-                pts
-            )
+        rect = obj.rect
 
-            pts_int = pts.astype(
-                np.int32
-            )
+        x = rect.left
+        y = rect.top
+        w = rect.width
+        h = rect.height
 
-            x, y, w, h = cv2.boundingRect(
-                pts_int
-            )
+        area = w * h
 
-            candidates.append(
-                {
-                    "text": text,
-                    "rect": (x, y, w, h),
-                    "area": area
-                }
-            )
+        candidates.append(
+            {
+                "text": text,
+                "rect": (x, y, w, h),
+                "area": area
+            }
+        )
 
     return candidates, binarized
-
+    
 def connect_camera(source):
     print(
         f"Conectando à câmera: {source}"
