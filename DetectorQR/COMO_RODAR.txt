@@ -1,0 +1,115 @@
+COMO RODAR O I6
+
+============================================================
+1. MODO TESTE - CÂMERA IP DIRETA
+============================================================
+
+1) Copie:
+   .env.example -> .env
+
+No Windows:
+   copy .env.example .env
+
+2) No .env:
+   I6_TEST_MODE=true
+
+3) Configure:
+   I6_TEST_CAMERAS_JSON=[{"source_id":"cam0","url":"http://IP:PORTA/video"}]
+
+4) Suba:
+   docker compose up --build
+
+5) Em outro terminal, para ver eventos Kafka:
+   python teste_consumer_i6_kafka.py
+
+6) Mostre um QR para a câmera.
+
+7) Para parar:
+   Ctrl+C
+   docker compose down
+
+
+============================================================
+2. VÁRIAS CÂMERAS NO MODO TESTE
+============================================================
+
+Exemplo:
+
+I6_TEST_CAMERAS_JSON=[{"source_id":"cam0","url":"http://IP1:PORTA/video"},{"source_id":"cam1","url":"http://IP2:PORTA/video"}]
+
+Cada source_id mantém seu próprio estado de leitura.
+
+
+============================================================
+3. MODO PRODUÇÃO - P4 VIA SOCKET TCP
+============================================================
+
+No .env:
+
+I6_TEST_MODE=false
+P4_HOST=p4
+P4_PORT=5000
+
+Depois:
+
+docker compose up --build
+
+O I6 tenta conectar ao P4 automaticamente.
+Se o P4 ainda não estiver disponível ou a conexão cair,
+o I6 espera e tenta novamente.
+
+Protocolo TCP provisório esperado:
+
+   4 bytes -> tamanho do JSON
+   N bytes -> JSON ods.p4.frame
+   8 bytes -> tamanho da imagem
+   M bytes -> buffer bruto da imagem
+
+ATENÇÃO:
+Esse framing ainda precisa ser confirmado com a equipe P4.
+Se eles enviarem de outra maneira, normalmente basta alterar
+receber_frame_p4().
+
+
+============================================================
+4. TESTAR O SOCKET SEM TER O P4 REAL
+============================================================
+
+mock_p4.py é apenas uma ferramenta de teste para simular
+a saída TCP do P4.
+
+Instale localmente:
+   pip install opencv-contrib-python-headless
+
+Execute:
+   python mock_p4.py http://IP:PORTA/video cam0
+
+O mock escuta na porta TCP 5000.
+
+Se o mock estiver no Windows e I6 no Docker:
+
+   I6_TEST_MODE=false
+   P4_HOST=host.docker.internal
+   P4_PORT=5000
+
+Depois:
+   docker compose up --build
+
+
+============================================================
+5. LOGS
+============================================================
+
+Primeiro plano:
+   docker compose up --build
+
+Background:
+   docker compose up -d --build
+   docker logs -f ods-i6
+
+
+============================================================
+6. PARAR
+============================================================
+
+docker compose down
