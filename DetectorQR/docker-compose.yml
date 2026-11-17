@@ -1,0 +1,14 @@
+services:
+  i6:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    image: ods-i6:2.0
+    container_name: ods-i6
+
+    env_file:
+      - .env
+
+    restart: unless-stopped
+    init: true
