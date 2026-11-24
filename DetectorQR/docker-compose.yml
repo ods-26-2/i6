@@ -1,14 +1,11 @@
 services:
   i6:
-    build:
-      context: .
-      dockerfile: Dockerfile
-
-    image: ods-i6:2.0
+    build: .
     container_name: ods-i6
-
     env_file:
       - .env
-
+    # P4 executado no host Linux: mesma memória compartilhada e socket Unix.
+    ipc: host
+    volumes:
+      - /tmp:/tmp:ro
     restart: unless-stopped
-    init: true

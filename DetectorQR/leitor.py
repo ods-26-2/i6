@@ -38,6 +38,15 @@ def ler_bool(nome, padrao=False):
 
 MODO_TESTE = ler_bool("I6_TEST_MODE", False)
 
+# Nova seleção explícita de fonte. Sem a variável, conserva o modo
+# teste direto se I6_TEST_MODE=true; caso contrário usa o P4 real.
+MODO_FONTE = os.getenv(
+    "I6_SOURCE_MODE", "direto" if MODO_TESTE else "camera"
+).strip().lower()
+P4_CAMERAS = os.getenv("I6_P4_CAMERA", "imx519")
+P4_SHM_TIMEOUT_SECONDS = float(os.getenv("I6_P4_SHM_TIMEOUT_SECONDS", "10"))
+P4_EXIGIR_TIMESTAMP = ler_bool("I6_P4_REQUIRE_CAPTURE_TIMESTAMP", False)
+
 KAFKA_BOOTSTRAP_SERVERS = os.getenv(
     "KAFKA_BOOTSTRAP_SERVERS",
     "34.66.235.91:9093"
@@ -467,9 +476,13 @@ def detectar_e_decodificar(frame):
                 "utf-8"
             )
         except UnicodeDecodeError:
-            # O contrato atual exige string.
-            # Não inventamos Base64 aqui.
-            continue
+            # QR AES binário de 16 bytes: representação textual HEX
+            # compatível com o interpretador do A2. Outros códigos
+            # não UTF-8 continuam sendo descartados.
+            if code_type == "QR_CODE" and len(obj.data) == 16:
+                decoded_data = obj.data.hex()
+            else:
+                continue
 
         if not decoded_data:
             continue
@@ -1318,6 +1331,213 @@ def executar_modo_p4():
 
 
 # ============================================================
+# 8B. P4 REAL - GStreamer SHM (protocolo P4R1)
+# ============================================================
+
+P4_SHM_SOCKETS = {
+    "imx519": "/tmp/p4_imx519_shm",
+    "imx477": "/tmp/p4_imx477_shm",
+    "video": "/tmp/p4_file_shm"
+}
+
+
+def selecionar_sockets_p4():
+    if MODO_FONTE == "video":
+        nomes = ["video"]
+    else:
+        nomes = [nome.strip().lower() for nome in P4_CAMERAS.split(",")]
+        if not nomes or any(nome not in ("imx519", "imx477") for nome in nomes):
+            raise ValueError("I6_P4_CAMERA deve ser imx519, imx477 ou imx519,imx477.")
+        nomes = list(dict.fromkeys(nomes))
+        if MODO_FONTE == "ambos":
+            nomes.append("video")
+    return {nome: P4_SHM_SOCKETS[nome] for nome in nomes}
+
+
+def raw_ns_para_utc(timestamp_ns):
+    # RAW e UTC são relógios diferentes. Mede o offset local.
+    antes = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    utc = time.time_ns()
+    depois = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    utc_ns = timestamp_ns + utc - (antes + depois) // 2
+    segundos, nanos = divmod(utc_ns, 1_000_000_000)
+    return datetime.fromtimestamp(segundos, timezone.utc).replace(
+        microsecond=nanos // 1000
+    ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+avisos_timestamp = set()
+
+
+def timestamp_p4_shm(campos):
+    # Para RG10, o timestamp original do driver pode ser TSC.
+    # Nunca o interprete diretamente como UTC ou MONOTONIC_RAW.
+    pares = [("timestamp_monotonic_raw_ns", "timestamp_monotonic_raw_clock")]
+    if campos["format"] == "BGR8":
+        # O MP4 fornece o instante da reprodução, não da filmagem.
+        pares = [("received_at_monotonic_raw_ns", "received_at_monotonic_raw_clock")]
+    for valor, relogio in pares:
+        ns = campos.get(valor)
+        if type(ns) is int and ns >= 0 and campos.get(relogio) == "CLOCK_MONOTONIC_RAW":
+            return raw_ns_para_utc(ns)
+    if P4_EXIGIR_TIMESTAMP:
+        raise ValueError("P4 não enviou timestamp normalizado. Habilite a normalização TSC na câmera.")
+    chave = (campos["source_id"], campos["session_id"])
+    if chave not in avisos_timestamp:
+        avisos_timestamp.add(chave)
+        print(f"[P4/SHM] {campos['source_id']}: sem timestamp RAW normalizado; "
+              "captured_at aproximado pelo recebimento no I6.", flush=True)
+    return agora_iso_utc()
+
+
+def decodificar_pacote_p4r1(pacote):
+    # Cada Gst.Buffer contém um pacote completo:
+    # P4R1 + uint32 big-endian (JSON) + JSON + bytes dos pixels.
+    if len(pacote) < 8 or pacote[:4] != b"P4R1":
+        raise ValueError("Identificador P4R1 inválido.")
+    tamanho_json = struct.unpack("!I", pacote[4:8])[0]
+    inicio = 8 + tamanho_json
+    if not 0 < tamanho_json <= P4_MAX_METADATA_BYTES or inicio > len(pacote):
+        raise ValueError("Tamanho do cabeçalho P4R1 inválido.")
+    campos = json.loads(pacote[8:inicio].decode("utf-8"))
+    if not isinstance(campos, dict):
+        raise ValueError("Cabeçalho P4R1 não é um objeto JSON.")
+    source_id = campos.get("source_id")
+    if not isinstance(source_id, str) or not source_id.strip():
+        raise ValueError("source_id inválido no P4R1.")
+    session_id = campos.get("session_id")
+    validar_uuid(session_id, "session_id")
+    largura, altura = campos.get("width"), campos.get("height")
+    indice = campos.get("frame_id")
+    if any(type(n) is not int or n <= 0 for n in (largura, altura)):
+        raise ValueError("Dimensões P4R1 inválidas.")
+    if type(indice) is not int or indice < 0:
+        raise ValueError("frame_id inválido.")
+    formato = campos.get("format")
+    if formato not in ("RG10", "BGR8"):
+        raise ValueError(f"Formato P4R1 não suportado: {formato}")
+    tamanho = largura * altura * (2 if formato == "RG10" else 3)
+    if (tamanho > P4_MAX_FRAME_BYTES or type(campos.get("data_size")) is not int
+            or campos["data_size"] != tamanho or len(pacote) - inicio != tamanho):
+        raise ValueError("Tamanho dos pixels incompatível com P4R1.")
+    pixels = memoryview(pacote)[inicio:]
+    if formato == "RG10":
+        # Mesma conversão usada em p4/scripts/p4_ler.sh.
+        raw16 = np.frombuffer(pixels, dtype="<u2").reshape(altura, largura)
+        raw8 = (raw16 >> 2).astype(np.uint8)
+        frame = cv2.cvtColor(raw8, cv2.COLOR_BayerRG2BGR)
+    else:
+        frame = np.frombuffer(pixels, dtype=np.uint8).reshape(altura, largura, 3)
+    metadados = {
+        "source_id": source_id,
+        "session_id": str(uuid.UUID(str(session_id))),
+        "frame_index": indice,
+        "captured_at": timestamp_p4_shm(campos),
+        "image_width": largura,
+        "image_height": altura,
+        "pixel_format": formato
+    }
+    return frame, metadados
+
+
+def abrir_shm(Gst, caminho):
+    # O shmsrc usa o socket Unix para acessar a memória compartilhada.
+    pipeline = Gst.parse_launch(
+        f'shmsrc socket-path="{caminho}" is-live=true do-timestamp=true '
+        '! application/x-ods-frame,version=1 '
+        '! appsink name=sink sync=false max-buffers=1 drop=true'
+    )
+    try:
+        if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError("Falha ao iniciar pipeline SHM.")
+        return pipeline, pipeline.get_by_name("sink"), pipeline.get_bus()
+    except Exception:
+        pipeline.set_state(Gst.State.NULL)
+        raise
+
+
+def executar_modo_shm():
+    try:
+        import gi
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+    except (ImportError, ValueError) as erro:
+        raise RuntimeError("Instale python3-gi, gir1.2-gstreamer-1.0 e os plugins GStreamer. "
+                           "Se usar venv, crie com --system-site-packages.") from erro
+    Gst.init(None)
+    for plugin in ("shmsrc", "appsink"):
+        if Gst.ElementFactory.find(plugin) is None:
+            raise RuntimeError(f"Plugin GStreamer ausente: {plugin}.")
+    fontes = {nome: {"path": caminho, "pipeline": None, "retry": 0.0}
+              for nome, caminho in selecionar_sockets_p4().items()}
+    print(f"[I6] P4/SHM: {selecionar_sockets_p4()}", flush=True)
+
+    def desconectar(fonte):
+        if fonte["pipeline"] is not None:
+            fonte["pipeline"].set_state(Gst.State.NULL)
+        fonte["pipeline"] = None
+        fonte["retry"] = time.monotonic() + P4_CONNECT_RETRY_SECONDS
+
+    try:
+        while True:
+            teve_frame = False
+            for nome, fonte in fontes.items():
+                agora = time.monotonic()
+                try:
+                    if fonte["pipeline"] is None:
+                        if agora < fonte["retry"]:
+                            continue
+                        if not os.path.exists(fonte["path"]):
+                            print(f"[P4/SHM] aguardando {fonte['path']}", flush=True)
+                            fonte["retry"] = agora + P4_CONNECT_RETRY_SECONDS
+                            continue
+                        pipeline, sink, bus = abrir_shm(Gst, fonte["path"])
+                        fonte.update(pipeline=pipeline, sink=sink, bus=bus, ultimo=agora)
+                        print(f"[P4/SHM] {nome}: aguardando frames.", flush=True)
+                    mensagem = fonte["bus"].pop_filtered(Gst.MessageType.ERROR | Gst.MessageType.EOS)
+                    if mensagem is not None:
+                        if mensagem.type == Gst.MessageType.ERROR:
+                            erro, _ = mensagem.parse_error()
+                            raise RuntimeError(str(erro))
+                        raise RuntimeError("Fim do stream P4.")
+                    sample = fonte["sink"].emit("try-pull-sample", 0)
+                    if sample is None:
+                        if agora - fonte["ultimo"] > P4_SHM_TIMEOUT_SECONDS:
+                            raise RuntimeError("Tempo limite sem frames.")
+                        continue
+                    buffer = sample.get_buffer()
+                    if buffer.get_size() > P4_MAX_FRAME_BYTES + P4_MAX_METADATA_BYTES + 8:
+                        raise ValueError("Pacote GStreamer grande demais.")
+                    ok, mapped = buffer.map(Gst.MapFlags.READ)
+                    if not ok:
+                        raise RuntimeError("Falha ao mapear o buffer SHM.")
+                    try:
+                        pacote = bytes(mapped.data)
+                    finally:
+                        buffer.unmap(mapped)
+                    fonte["ultimo"] = time.monotonic()
+                    teve_frame = True
+                    frame, metadados = decodificar_pacote_p4r1(pacote)
+                    if nome != "video" and metadados["source_id"] != nome:
+                        raise ValueError(f"Socket {nome} entregou source_id inesperado.")
+                    processar_frame(frame, metadados)
+                except BufferError:
+                    print("[Kafka] fila cheia; leitura descartada.", flush=True)
+                except Exception as erro:
+                    print(f"[P4/SHM] {nome}: {erro}. Reconectando em "
+                          f"{P4_CONNECT_RETRY_SECONDS:g}s.", flush=True)
+                    desconectar(fonte)
+            # Processa os callbacks Kafka mesmo quando não há QR novo.
+            if producer is not None:
+                producer.poll(0)
+            if not teve_frame:
+                time.sleep(0.01)
+    finally:
+        for fonte in fontes.values():
+            desconectar(fonte)
+
+
+# ============================================================
 # 9. MODO TESTE - CÂMERAS IP DIRETAS
 # ============================================================
 
@@ -1594,6 +1814,13 @@ def executar_modo_teste():
 # ============================================================
 
 def validar_configuracao():
+    if MODO_FONTE not in ("camera", "video", "ambos", "direto", "tcp"):
+        raise ValueError("I6_SOURCE_MODE deve ser camera, video, ambos, direto ou tcp.")
+    if MODO_FONTE in ("camera", "video", "ambos"):
+        selecionar_sockets_p4()
+    if not (0 < P4_CONNECT_RETRY_SECONDS < float("inf") and
+            0 < P4_SHM_TIMEOUT_SECONDS < float("inf")):
+        raise ValueError("Intervalos do P4 devem ser positivos e finitos.")
     if not KAFKA_BOOTSTRAP_SERVERS.strip():
         raise ValueError(
             "KAFKA_BOOTSTRAP_SERVERS "
@@ -1643,7 +1870,7 @@ def main():
     )
 
     print(
-        f"I6_TEST_MODE={MODO_TESTE}"
+        f"I6_SOURCE_MODE={MODO_FONTE}"
     )
 
     print(
@@ -1657,11 +1884,12 @@ def main():
         # AQUI ESTÁ A DIVISÃO PRINCIPAL PEDIDA:
         # ====================================================
 
-        if MODO_TESTE:
+        if MODO_FONTE == "direto":
             executar_modo_teste()
-
-        else:
+        elif MODO_FONTE == "tcp":
             executar_modo_p4()
+        else:
+            executar_modo_shm()
 
     except KeyboardInterrupt:
         print(
