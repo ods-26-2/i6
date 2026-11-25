@@ -1337,7 +1337,7 @@ def executar_modo_p4():
 P4_SHM_SOCKETS = {
     "imx519": "/tmp/p4_imx519_shm",
     "imx477": "/tmp/p4_imx477_shm",
-    "video": "/tmp/p4_file_shm"
+    "video": "/tmp/VER2"
 }
 
 
