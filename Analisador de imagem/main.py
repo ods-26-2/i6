@@ -52,6 +52,14 @@ P4_MAX_FRAME_BYTES = 64 * 1024 * 1024
 # Limite de análises por segundo. 0 = analisar todos os frames recebidos.
 MAX_ANALYSIS_FPS = float(os.getenv("I6_MAX_ANALYSIS_FPS", "5.0"))
 
+# Limite independente de publicações no Kafka.
+# Ex.: 2 envios em 60 segundos = um envio a cada 30 segundos.
+MAX_SENDS = int(os.getenv("I6_MAX_SENDS", "2"))
+SEND_PERIOD_SECONDS = float(os.getenv("I6_SEND_PERIOD_SECONDS", "60"))
+SEND_INTERVAL_SECONDS = (
+    SEND_PERIOD_SECONDS / MAX_SENDS if MAX_SENDS > 0 else None
+)
+
 TEST_IMAGE_PATH = os.getenv("I6_TEST_IMAGE_PATH", "/app/imagemdeteste.jpg")
 TEST_SOURCE_ID = os.getenv("I6_TEST_SOURCE_ID", "image-analyzer-test")
 
@@ -59,6 +67,7 @@ PIXEL_FORMATS_VALIDOS = {"NV12", "RGB", "BGR", "GRAY"}
 producer = None
 sequence = 0
 ultimo_frame_analisado = {}
+ultimo_envio_kafka = None
 
 
 def agora_iso_utc():
@@ -228,6 +237,15 @@ def deve_analisar_frame(source_id):
     return True
 
 
+def deve_publicar_resultado():
+    """Permite publicar no máximo um resultado por intervalo configurado."""
+    if ultimo_envio_kafka is None:
+        return True
+
+    agora = time.monotonic()
+    return (agora - ultimo_envio_kafka) >= SEND_INTERVAL_SECONDS
+
+
 def callback_kafka(erro, mensagem):
     if erro is not None:
         print(f"[Kafka] falha na entrega: {erro}")
@@ -303,10 +321,18 @@ def publicar_resultado(metadados, resultado):
 
 
 def processar_frame(frame, metadados):
+    global ultimo_envio_kafka
+
     if not deve_analisar_frame(metadados["source_id"]):
         return False
+
+    # A análise continua acontecendo normalmente. Se ainda não chegou o
+    # momento do próximo envio, este resultado é descartado (sem criar fila).
     resultado = analisar_frame(frame)
-    publicar_resultado(metadados, resultado)
+    if deve_publicar_resultado():
+        publicar_resultado(metadados, resultado)
+        ultimo_envio_kafka = time.monotonic()
+
     return True
 
 
@@ -318,6 +344,10 @@ def executar_modo_p4():
     print("[I6] MODO PRODUÇÃO - Analisador de Imagem")
     print(f"[P4] tentando conectar em {P4_HOST}:{P4_PORT}")
     print(f"[I6] limite de análise: {MAX_ANALYSIS_FPS:g} FPS (0 = todos os frames)")
+    print(
+        f"[Kafka] limite de publicação: {MAX_SENDS} envios/"
+        f"{SEND_PERIOD_SECONDS:g}s (intervalo mínimo: {SEND_INTERVAL_SECONDS:g}s)"
+    )
 
     while True:
         conexao = None
@@ -359,6 +389,10 @@ def executar_modo_teste():
     frame_index = 0
     print(f"[TESTE] imagem carregada: {TEST_IMAGE_PATH} ({largura}x{altura})")
     print(f"[I6] limite de análise: {MAX_ANALYSIS_FPS:g} FPS (0 = todos os frames)")
+    print(
+        f"[Kafka] limite de publicação: {MAX_SENDS} envios/"
+        f"{SEND_PERIOD_SECONDS:g}s (intervalo mínimo: {SEND_INTERVAL_SECONDS:g}s)"
+    )
 
     while True:
         metadados = {
@@ -383,6 +417,10 @@ def validar_configuracao():
         raise ValueError("KAFKA_TOPIC não pode ser vazio.")
     if MAX_ANALYSIS_FPS < 0:
         raise ValueError("I6_MAX_ANALYSIS_FPS deve ser >= 0. Use 0 para analisar todos os frames.")
+    if MAX_SENDS <= 0:
+        raise ValueError("I6_MAX_SENDS deve ser um inteiro > 0.")
+    if SEND_PERIOD_SECONDS <= 0:
+        raise ValueError("I6_SEND_PERIOD_SECONDS deve ser > 0.")
     if P4_PORT < 1 or P4_PORT > 65535:
         raise ValueError("P4_PORT deve estar entre 1 e 65535.")
     if P4_CONNECT_RETRY_SECONDS <= 0:
